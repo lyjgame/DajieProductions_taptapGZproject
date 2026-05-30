@@ -67,17 +67,24 @@ local C = {
 local screenW, screenH = 0, 0
 
 -- ============================================================================
--- NanoVG 上下文（从 UI 系统获取）
+-- NanoVG 上下文
 -- ============================================================================
 local vg = nil
+local fontCreated = false
 
 -- ============================================================================
 -- 初始化
 -- ============================================================================
 
 function GameScene.Init()
-    -- 获取 NanoVG 上下文
-    vg = UI.GetNanoVGContext()
+    -- 创建独立的 NanoVG 上下文（与 UI 系统并行使用）
+    vg = nvgCreate(1 + 2 + 4)
+
+    -- 创建字体（只创建一次）
+    if not fontCreated then
+        nvgCreateFont(vg, "sans", "Fonts/MiSans-Regular.ttf")
+        fontCreated = true
+    end
 
     -- 重置游戏状态
     GameScene.ResetGame()
