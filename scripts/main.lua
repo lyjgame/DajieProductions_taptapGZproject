@@ -1,32 +1,31 @@
 -- ============================================================================
--- 大杰 TapTap 广州 GameJam 项目
--- 基于 UrhoX 3D 第三人称角色脚手架
+-- 点球SlowMo - 主菜单
+-- 5秒决胜负！
 -- ============================================================================
 
--- 引入工具库
 require "LuaScripts/Utilities/Sample"
-require "LuaScripts/Utilities/Touch"
-require "urhox-libs.UI.GameHUD"
-require "urhox-libs.Camera.ThirdPersonCamera"
 local UI = require("urhox-libs/UI")
 
--- 引入游戏模块
-local GameConfig = require("GameConfig")
-local SceneBuilder = require("SceneBuilder")
-local PlayerController = require("PlayerController")
-
 -- ============================================================================
--- 全局变量
+-- 配色方案
 -- ============================================================================
-
----@type Scene
-local scene_ = nil
----@type ThirdPersonCameraInstance
-local tpCamera_ = nil
----@type CharacterComponent
-local character_ = nil
----@type AnimationStateMachine
-local stateMachine_ = nil
+local COLORS = {
+    -- 主背景：深绿色（足球场感觉）
+    bgTop = { 15, 55, 35, 255 },
+    bgBottom = { 8, 30, 18, 255 },
+    -- 强调色：金色
+    accent = { 255, 200, 50, 255 },
+    accentDark = { 200, 155, 30, 255 },
+    -- 按钮
+    btnPrimary = { 40, 180, 80, 255 },
+    btnPrimaryHover = { 50, 210, 95, 255 },
+    btnSecondary = { 30, 120, 60, 255 },
+    btnSecondaryHover = { 40, 150, 75, 255 },
+    -- 文字
+    textWhite = { 255, 255, 255, 255 },
+    textLight = { 220, 240, 220, 200 },
+    textGold = { 255, 210, 60, 255 },
+}
 
 -- ============================================================================
 -- 生命周期
@@ -35,55 +34,7 @@ local stateMachine_ = nil
 function Start()
     SampleStart()
 
-    -- 创建场景
-    scene_ = SceneBuilder.CreateScene()
-
-    -- 创建相机
-    tpCamera_ = ThirdPersonCamera.Create(scene_, {
-        modes = {
-            normal = {
-                distance = GameConfig.Camera.Distance,
-                offset = GameConfig.Camera.Offset,
-                fov = GameConfig.Camera.FOV,
-            },
-        },
-        transitionSpeed = 8.0,
-        farClip = GameConfig.Camera.FarClip,
-    })
-    renderer:SetViewport(0, Viewport:new(scene_, tpCamera_:GetCamera()))
-
-    -- 创建角色
-    local playerData = PlayerController.CreatePlayer(scene_)
-    character_ = playerData.character
-    stateMachine_ = playerData.stateMachine
-
-    -- 创建 UI
-    CreateUI()
-
-    -- 创建 GameHUD（摇杆 + 跳跃按钮）
-    CreateGameHUD()
-
-    -- 订阅事件
-    SubscribeToEvent("Update", "HandleUpdate")
-    SubscribeToEvent("PostUpdate", "HandlePostUpdate")
-    UnsubscribeFromEvent("SceneUpdate")
-
-    -- 锁定鼠标（第三人称视角控制）
-    SampleInitMouseMode(MM_RELATIVE)
-
-    print("=== GameJam Project Started ===")
-    print("WASD: 移动 | Shift: 跑步 | Space: 跳跃")
-end
-
-function Stop()
-    UI.Shutdown()
-end
-
--- ============================================================================
--- UI
--- ============================================================================
-
-function CreateUI()
+    -- 初始化 UI 系统
     UI.Init({
         fonts = {
             { family = "sans", weights = { normal = "Fonts/MiSans-Regular.ttf" } }
@@ -91,88 +42,121 @@ function CreateUI()
         scale = UI.Scale.DEFAULT,
     })
 
+    -- 构建主菜单
+    CreateMainMenu()
+
+    -- 鼠标可见（菜单界面）
+    SampleInitMouseMode(MM_FREE)
+
+    print("=== 点球SlowMo 主菜单 ===")
+end
+
+function Stop()
+    UI.Shutdown()
+end
+
+-- ============================================================================
+-- 主菜单 UI
+-- ============================================================================
+
+function CreateMainMenu()
+    -- 菜单按钮生成函数
+    local function MenuButton(text, isPrimary, onClickFn)
+        local bgColor = isPrimary and COLORS.btnPrimary or COLORS.btnSecondary
+        local hoverColor = isPrimary and COLORS.btnPrimaryHover or COLORS.btnSecondaryHover
+
+        return UI.Button {
+            text = text,
+            fontSize = 18,
+            fontColor = COLORS.textWhite,
+            width = 240,
+            height = 52,
+            borderRadius = 26,
+            backgroundColor = bgColor,
+            justifyContent = "center",
+            alignItems = "center",
+            -- 按钮边框增强质感
+            borderWidth = isPrimary and 2 or 1,
+            borderColor = isPrimary and COLORS.accent or { 80, 200, 120, 100 },
+            onClick = function(self)
+                print("[Menu] Clicked: " .. text)
+                if onClickFn then onClickFn() end
+            end,
+            onHoverIn = function(self)
+                self:SetStyle({ backgroundColor = hoverColor })
+            end,
+            onHoverOut = function(self)
+                self:SetStyle({ backgroundColor = bgColor })
+            end,
+        }
+    end
+
+    -- 根容器
     local root = UI.Panel {
-        width = "100%", height = "100%",
-        pointerEvents = "box-none",
+        width = "100%",
+        height = "100%",
+        backgroundColor = COLORS.bgTop,
+        justifyContent = "center",
+        alignItems = "center",
         children = {
-            UI.Label {
-                id = "instructions",
-                text = "WASD: 移动 | Shift: 跑步 | Space: 跳跃",
-                fontSize = 12,
-                fontColor = { 255, 255, 200, 200 },
-                position = "absolute",
-                top = 10,
-                left = 0,
-                right = 0,
-                textAlign = "center",
-                width = "100%",
-            },
+            -- 内容容器（垂直居中）
+            UI.Panel {
+                alignItems = "center",
+                justifyContent = "center",
+                gap = 12,
+                children = {
+                    -- 足球装饰 emoji
+                    UI.Label {
+                        text = "⚽",
+                        fontSize = 48,
+                        marginBottom = 8,
+                    },
+
+                    -- 主标题
+                    UI.Label {
+                        text = "点球SlowMo",
+                        fontSize = 36,
+                        fontColor = COLORS.textWhite,
+                        textAlign = "center",
+                    },
+
+                    -- 副标题
+                    UI.Label {
+                        text = "5秒决胜负",
+                        fontSize = 16,
+                        fontColor = COLORS.textGold,
+                        textAlign = "center",
+                        marginBottom = 32,
+                    },
+
+                    -- 按钮组
+                    MenuButton("单人游戏", true, function()
+                        -- TODO: 进入单人游戏
+                        print("进入单人游戏")
+                    end),
+
+                    MenuButton("多人游戏", false, function()
+                        -- TODO: 进入多人游戏
+                        print("进入多人游戏")
+                    end),
+
+                    MenuButton("游戏玩法", false, function()
+                        -- TODO: 显示玩法说明
+                        print("显示游戏玩法")
+                    end),
+
+                    -- 底部版本信息
+                    UI.Label {
+                        text = "大杰出品 · TapTap GameJam 广州",
+                        fontSize = 11,
+                        fontColor = COLORS.textLight,
+                        textAlign = "center",
+                        marginTop = 40,
+                    },
+                }
+            }
         }
     }
+
     UI.SetRoot(root)
-end
-
-function CreateGameHUD()
-    GameHUD.Initialize()
-    GameHUD.SetControls(character_.controls)
-
-    GameHUD.Create({
-        enableJump = true,
-        enableRun = true,
-        enableShooter = false,  -- 暂不启用射击系统，可后续开启
-    })
-
-    -- 移动端触摸视角控制
-    GameHUD.EnableTouchLook({
-        camera = tpCamera_:GetNode(),
-    })
-end
-
--- ============================================================================
--- 事件处理
--- ============================================================================
-
----@param eventType string
----@param eventData UpdateEventData
-function HandleUpdate(eventType, eventData)
-    if character_ == nil then return end
-
-    -- 触摸输入
-    if touchEnabled then
-        UpdateTouches(character_.controls)
-    end
-
-    -- PC 鼠标视角控制
-    if ui.focusElement == nil and not touchEnabled then
-        character_.controls.yaw = character_.controls.yaw + input.mouseMoveX * YAW_SENSITIVITY
-        character_.controls.pitch = character_.controls.pitch + input.mouseMoveY * YAW_SENSITIVITY
-        character_.controls.pitch = Clamp(character_.controls.pitch, -80.0, 80.0)
-    end
-end
-
----@param eventType string
----@param eventData PostUpdateEventData
-function HandlePostUpdate(eventType, eventData)
-    if character_ == nil then return end
-
-    -- 更新动画状态机参数
-    if stateMachine_ ~= nil then
-        local moveSpeed = character_:GetMoveSpeed()
-        local isGrounded = character_:IsOnGround()
-        local isJumping = character_:IsJumping()
-
-        if character_:IsJumpStarted() then
-            stateMachine_:SetTrigger("jump")
-        end
-
-        local effectiveGrounded = isGrounded and not isJumping
-        stateMachine_:SetFloat("moveSpeed", moveSpeed)
-        stateMachine_:SetBool("isGrounded", effectiveGrounded)
-        stateMachine_:SetBool("isJumping", isJumping)
-    end
-
-    -- 更新第三人称相机
-    local timeStep = eventData["TimeStep"]:GetFloat()
-    local characterNode = character_:GetNode()
-    tpCamera_:Update(timeStep, characterNode, character_.controls.yaw, character_.controls.pitch)
 end
