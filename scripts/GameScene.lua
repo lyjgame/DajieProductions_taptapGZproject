@@ -1,123 +1,229 @@
 -- ============================================================================
--- GameScene.lua - 单人点球大战游戏场景
--- 视角：从射手身后看向球门（2D 正面视角）
--- 渲染：NanoVG 自定义绘制
+-- GameScene.lua - 点球SlowMo 单人游戏场景
+-- 主罚视角：从射手身后看向球门（2D NanoVG 渲染）
+-- 核心机制：拖拽足球射门 + 5秒SlowMo倒计时
 -- ============================================================================
-
-local UI = require("urhox-libs/UI")
 
 local GameScene = {}
 
 -- ============================================================================
--- 游戏状态
+-- 游戏状态机
 -- ============================================================================
 local STATE = {
-    READY = "ready",          -- 准备射门（可以瞄准）
-    SHOOTING = "shooting",    -- 球飞行中
-    GOAL = "goal",            -- 进球
-    SAVED = "saved",          -- 被扑出
-    OPPONENT = "opponent",    -- 对手射门阶段
-    ROUND_END = "round_end", -- 一轮结束
+    ROUND_INTRO = "round_intro",    -- 轮次介绍
+    KICKER_AIM = "kicker_aim",      -- 射手瞄准阶段（SlowMo倒计时中）
+    BALL_FLYING = "ball_flying",    -- 球飞行中
+    RESULT_SHOW = "result_show",    -- 显示单球结果
+    KEEPER_TURN = "keeper_turn",    -- 守门员阶段（AI射门）
+    KEEPER_RESULT = "keeper_result",-- 守门员阶段结果
+    SUDDEN_DEATH = "sudden_death",  -- 突然死亡提示
+    MATCH_END = "match_end",        -- 比赛结束
 }
 
+-- ============================================================================
+-- 球门5区域定义（归一化坐标，相对于球门区域）
+-- ============================================================================
+local ZONES = {
+    { name = "左上", nx = 0.2, ny = 0.3 },
+    { name = "左下", nx = 0.2, ny = 0.7 },
+    { name = "中路", nx = 0.5, ny = 0.5 },
+    { name = "右上", nx = 0.8, ny = 0.3 },
+    { name = "右下", nx = 0.8, ny = 0.7 },
+}
+
+-- ============================================================================
 -- 游戏数据
-local game = {
-    state = STATE.READY,
-    round = 1,
-    maxRounds = 5,
-    playerScore = 0,
-    opponentScore = 0,
+-- ============================================================================
+local game = {}
 
-    -- 球的位置和运动
-    ball = { x = 0.5, y = 0.85 },    -- 归一化坐标 (0-1)
-    ballTarget = { x = 0.5, y = 0.3 }, -- 射门目标
-    ballProgress = 0,                  -- 球飞行进度 0-1
+local function ResetGameData()
+    game = {
+        state = STATE.ROUND_INTRO,
+        round = 1,
+        maxRounds = 5,
+        playerScore = 0,
+        opponentScore = 0,
+        -- 点球记录: "goal" / "saved" / "missed" / nil
+        playerRecord = {},
+        opponentRecord = {},
 
-    -- 守门员
-    keeper = { x = 0.5, y = 0.32 },   -- 守门员位置
-    keeperTarget = { x = 0.5 },        -- 扑救目标
+        -- SlowMo 倒计时
+        countdown = 5.0,
+        countdownInt = 5,    -- 当前显示的整数
 
-    -- 瞄准
-    aimX = 0.5,   -- 瞄准位置 (0-1 水平)
-    aimY = 0.35,  -- 瞄准位置 (垂直)
+        -- 拖拽射门状态
+        isDragging = false,
+        dragStartX = 0,
+        dragStartY = 0,
+        dragCurrentX = 0,
+        dragCurrentY = 0,
+        dragPower = 0,       -- 0-1 力量值
+        dragAngle = 0,       -- 拖拽角度（弧度）
+        shotZone = 0,        -- 目标区域索引 1-5
 
-    -- 计时
-    timer = 0,
-    stateTimer = 0,
-}
+        -- 球飞行动画
+        ballStartX = 0,
+        ballStartY = 0,
+        ballTargetX = 0,
+        ballTargetY = 0,
+        ballProgress = 0,    -- 0-1 飞行进度
+        ballX = 0,
+        ballY = 0,
 
--- 颜色
+        -- 守门员
+        keeperX = 0.5,       -- 归一化位置
+        keeperTargetX = 0.5,
+        keeperDiveDir = 0,   -- -1左 0中 1右
+
+        -- 射门结果
+        lastResult = "",     -- "goal" / "saved" / "missed"
+        lastResultText = "",
+        lastResultDesc = "",
+
+        -- 计时器
+        stateTimer = 0,
+        totalTimer = 0,
+
+        -- 是否已射门（倒计时内）
+        hasShot = false,
+
+        -- AI对手射门 (守门员阶段)
+        aiShotZone = 0,
+        aiPower = 0,
+        playerDiveDir = 0,   -- 玩家作为门将的扑救方向
+    }
+end
+
+-- ============================================================================
+-- 颜色主题
+-- ============================================================================
 local C = {
-    pitch = { 34, 120, 50, 255 },
-    pitchDark = { 28, 100, 42, 255 },
-    pitchLine = { 255, 255, 255, 180 },
-    goal = { 255, 255, 255, 255 },
-    goalNet = { 200, 200, 200, 80 },
-    ball = { 255, 255, 255, 255 },
-    ballShadow = { 0, 0, 0, 60 },
-    keeper = { 255, 220, 50, 255 },
-    keeperBody = { 30, 30, 30, 255 },
-    aim = { 255, 60, 60, 180 },
-    hudBg = { 0, 0, 0, 160 },
+    -- 球场
+    pitchGreen = { 34, 130, 55, 255 },
+    pitchDark = { 28, 105, 45, 255 },
+    pitchLine = { 255, 255, 255, 200 },
+    -- 球门
+    goalPost = { 255, 255, 255, 255 },
+    goalNet = { 180, 180, 180, 60 },
+    -- 球
+    ballWhite = { 255, 255, 255, 255 },
+    ballPattern = { 40, 40, 40, 180 },
+    -- 角色
+    kickerShirt = { 200, 40, 40, 255 },    -- 红色球衣
+    kickerShorts = { 255, 255, 255, 255 },
+    kickerSkin = { 240, 200, 160, 255 },
+    kickerHair = { 80, 50, 30, 255 },
+    keeperShirt = { 40, 80, 200, 255 },    -- 蓝色球衣
+    keeperShorts = { 40, 40, 60, 255 },
+    keeperSkin = { 240, 200, 160, 255 },
+    -- HUD
+    hudBg = { 20, 20, 30, 220 },
+    hudRed = { 200, 50, 50, 255 },
+    hudBlue = { 50, 80, 200, 255 },
     textWhite = { 255, 255, 255, 255 },
     textGold = { 255, 210, 60, 255 },
+    textGray = { 180, 180, 180, 200 },
+    -- 区域
+    zoneBorder = { 255, 255, 255, 120 },
+    zoneHighlight = { 255, 255, 100, 80 },
+    -- 力量条
+    powerLow = { 80, 200, 80, 255 },
+    powerMid = { 255, 220, 50, 255 },
+    powerHigh = { 255, 60, 60, 255 },
+    -- 倒计时
+    countdownColor = { 255, 220, 50, 255 },
+    -- 轨迹箭头
+    trajectoryColor = { 255, 255, 255, 150 },
 }
 
--- 屏幕尺寸（在渲染时更新）
+-- 屏幕尺寸
 local screenW, screenH = 0, 0
 
--- ============================================================================
 -- NanoVG 上下文
--- ============================================================================
 local vg = nil
 local fontCreated = false
 
+-- 球门矩形（像素坐标，每帧计算）
+local goalRect = { left = 0, right = 0, top = 0, bottom = 0 }
+-- 球的默认位置（像素坐标）
+local ballDefaultPos = { x = 0, y = 0 }
+
 -- ============================================================================
--- 初始化
+-- 初始化 / 关闭
 -- ============================================================================
 
 function GameScene.Init()
-    -- 创建独立的 NanoVG 上下文（与 UI 系统并行使用）
     vg = nvgCreate(1 + 2 + 4)
-
-    -- 创建字体（只创建一次）
     if not fontCreated then
         nvgCreateFont(vg, "sans", "Fonts/MiSans-Regular.ttf")
         fontCreated = true
     end
 
-    -- 重置游戏状态
-    GameScene.ResetGame()
+    ResetGameData()
 
-    -- 订阅 NanoVG 渲染事件（用于自定义绘制）
     SubscribeToEvent("NanoVGRender", "HandleGameRender")
-    -- 订阅输入事件
     SubscribeToEvent("Update", "HandleGameUpdate")
     SubscribeToEvent("MouseButtonDown", "HandleGameMouseDown")
+    SubscribeToEvent("MouseButtonUp", "HandleGameMouseUp")
+    SubscribeToEvent("MouseMove", "HandleGameMouseMove")
     SubscribeToEvent("TouchBegin", "HandleGameTouchBegin")
+    SubscribeToEvent("TouchMove", "HandleGameTouchMove")
+    SubscribeToEvent("TouchEnd", "HandleGameTouchEnd")
 
-    print("[GameScene] Initialized")
+    print("[GameScene] 主罚视角初始化完成")
 end
 
 function GameScene.Shutdown()
     UnsubscribeFromEvent("NanoVGRender")
     UnsubscribeFromEvent("Update")
     UnsubscribeFromEvent("MouseButtonDown")
+    UnsubscribeFromEvent("MouseButtonUp")
+    UnsubscribeFromEvent("MouseMove")
     UnsubscribeFromEvent("TouchBegin")
+    UnsubscribeFromEvent("TouchMove")
+    UnsubscribeFromEvent("TouchEnd")
+    print("[GameScene] Shutdown")
 end
 
-function GameScene.ResetGame()
-    game.state = STATE.READY
-    game.round = 1
-    game.playerScore = 0
-    game.opponentScore = 0
-    game.ball = { x = 0.5, y = 0.85 }
-    game.ballProgress = 0
-    game.keeper = { x = 0.5, y = 0.32 }
-    game.aimX = 0.5
-    game.aimY = 0.35
-    game.timer = 0
-    game.stateTimer = 0
+-- ============================================================================
+-- 坐标系工具
+-- ============================================================================
+
+--- 计算球门和球的像素位置（每帧调用）
+local function UpdateLayout()
+    -- 球门位置（屏幕上方中央，参考示意图比例）
+    goalRect.left = screenW * 0.22
+    goalRect.right = screenW * 0.78
+    goalRect.top = screenH * 0.12
+    goalRect.bottom = screenH * 0.40
+
+    -- 球的默认位置（罚球点，屏幕下方中央偏下）
+    ballDefaultPos.x = screenW * 0.5
+    ballDefaultPos.y = screenH * 0.78
+end
+
+--- 将区域索引转为球门内的像素坐标
+local function ZoneToPixel(zoneIdx)
+    local zone = ZONES[zoneIdx]
+    if not zone then return screenW * 0.5, screenH * 0.26 end
+    local x = goalRect.left + (goalRect.right - goalRect.left) * zone.nx
+    local y = goalRect.top + (goalRect.bottom - goalRect.top) * zone.ny
+    return x, y
+end
+
+--- 根据拖拽方向计算目标区域
+local function CalcTargetZone(dx, dy)
+    -- dx: 水平偏移（正=右），dy: 垂直偏移（负=上）
+    -- 将方向映射到5个区域
+    local isLeft = dx < -0.15
+    local isRight = dx > 0.15
+    local isUp = dy < -0.3
+
+    if isLeft and isUp then return 1 end       -- 左上
+    if isLeft and not isUp then return 2 end   -- 左下
+    if isRight and isUp then return 4 end      -- 右上
+    if isRight and not isUp then return 5 end  -- 右下
+    return 3                                    -- 中路
 end
 
 -- ============================================================================
@@ -128,134 +234,376 @@ end
 ---@param eventData UpdateEventData
 function HandleGameUpdate(eventType, eventData)
     local dt = eventData["TimeStep"]:GetFloat()
-    game.timer = game.timer + dt
     game.stateTimer = game.stateTimer + dt
+    game.totalTimer = game.totalTimer + dt
 
-    if game.state == STATE.READY then
-        -- 瞄准阶段：光标轻微摆动（增加难度）
-        -- 玩家通过点击/触摸确定射门方向
+    if game.state == STATE.ROUND_INTRO then
+        -- 轮次介绍显示 2 秒后自动进入射门阶段
+        if game.stateTimer > 2.0 then
+            EnterKickerAim()
+        end
 
-    elseif game.state == STATE.SHOOTING then
-        -- 球飞行动画（慢动作效果）
-        local speed = 1.2  -- 慢动作速度
-        game.ballProgress = game.ballProgress + dt * speed
+    elseif game.state == STATE.KICKER_AIM then
+        -- SlowMo 倒计时
+        game.countdown = game.countdown - dt
+        game.countdownInt = math.ceil(game.countdown)
+        if game.countdownInt < 1 then game.countdownInt = 1 end
 
-        -- 更新球的位置（从起点到目标的插值）
+        -- 倒计时结束 → 如果没射门则默认射中路
+        if game.countdown <= 0 then
+            if not game.hasShot then
+                -- 超时未射门，默认中路、中等力量
+                ExecuteShot(3, 0.5)
+            end
+        end
+
+    elseif game.state == STATE.BALL_FLYING then
+        -- 球飞行动画
+        local flySpeed = 1.8
+        game.ballProgress = game.ballProgress + dt * flySpeed
+
         local t = math.min(game.ballProgress, 1.0)
-        -- 使用缓动函数让球运动更自然
-        local easeT = 1 - (1 - t) * (1 - t)
-        game.ball.x = Lerp(0.5, game.ballTarget.x, easeT)
-        game.ball.y = Lerp(0.85, game.ballTarget.y, easeT)
+        -- 缓入缓出
+        local easeT = t < 0.5 and (2 * t * t) or (1 - 2 * (1 - t) * (1 - t))
+
+        game.ballX = Lerp(game.ballStartX, game.ballTargetX, easeT)
+        game.ballY = Lerp(game.ballStartY, game.ballTargetY, easeT)
 
         -- 守门员扑救动画
-        local keeperT = math.min(game.stateTimer * 1.5, 1.0)
-        game.keeper.x = Lerp(0.5, game.keeperTarget.x, keeperT)
+        local keeperSpeed = 2.0
+        local kt = math.min(game.stateTimer * keeperSpeed, 1.0)
+        game.keeperX = Lerp(0.5, game.keeperTargetX, kt)
 
-        -- 判定结果
+        -- 球到达目标
         if game.ballProgress >= 1.0 then
-            local dx = math.abs(game.ball.x - game.keeper.x)
-            if dx < 0.08 then
-                -- 被扑出
-                game.state = STATE.SAVED
-            else
-                -- 进球
-                game.state = STATE.GOAL
-                game.playerScore = game.playerScore + 1
-            end
-            game.stateTimer = 0
+            DetermineResult()
         end
 
-    elseif game.state == STATE.GOAL or game.state == STATE.SAVED then
-        -- 显示结果 2 秒后进入下一轮
-        if game.stateTimer > 2.0 then
-            GameScene.NextRound()
+    elseif game.state == STATE.RESULT_SHOW then
+        -- 结果显示 2.5 秒后进入下一阶段
+        if game.stateTimer > 2.5 then
+            -- 进入对手射门阶段（AI踢，玩家守）
+            EnterKeeperTurn()
         end
 
-    elseif game.state == STATE.OPPONENT then
-        -- 对手射门阶段（AI 自动）
+    elseif game.state == STATE.KEEPER_TURN then
+        -- AI射门阶段：1.5秒后AI自动射门
         if game.stateTimer > 1.5 then
-            -- AI 射门结果（60% 进球概率）
-            if math.random() < 0.6 then
-                game.opponentScore = game.opponentScore + 1
-                game.state = STATE.GOAL
-            else
-                game.state = STATE.SAVED
-            end
+            ExecuteAIShot()
+        end
+
+    elseif game.state == STATE.KEEPER_RESULT then
+        -- 结果显示 2.5 秒后进入下一轮
+        if game.stateTimer > 2.5 then
+            AdvanceRound()
+        end
+
+    elseif game.state == STATE.SUDDEN_DEATH then
+        if game.stateTimer > 2.5 then
+            -- 重新开始下一轮（突然死亡轮）
+            game.state = STATE.ROUND_INTRO
             game.stateTimer = 0
         end
+
+    elseif game.state == STATE.MATCH_END then
+        -- 等待玩家点击继续
     end
 end
 
-function GameScene.NextRound()
-    if game.state == STATE.GOAL or game.state == STATE.SAVED then
-        -- 切换到对手射门或下一轮
-        if game.round <= game.maxRounds then
-            -- 重置球和守门员
-            game.ball = { x = 0.5, y = 0.85 }
-            game.ballProgress = 0
-            game.keeper = { x = 0.5, y = 0.32 }
-            game.aimX = 0.5
-            game.state = STATE.READY
+-- ============================================================================
+-- 状态切换函数
+-- ============================================================================
+
+function EnterKickerAim()
+    game.state = STATE.KICKER_AIM
+    game.stateTimer = 0
+    game.countdown = 5.0
+    game.countdownInt = 5
+    game.hasShot = false
+    game.isDragging = false
+    game.dragPower = 0
+    game.shotZone = 0
+    game.keeperX = 0.5
+    game.ballX = ballDefaultPos.x
+    game.ballY = ballDefaultPos.y
+    print("[GameScene] 轮次 " .. game.round .. " - 你是点球手，拖拽射门！")
+end
+
+function ExecuteShot(zoneIdx, power)
+    game.hasShot = true
+    game.shotZone = zoneIdx
+    game.dragPower = power
+
+    -- 设置球的起始和目标位置
+    game.ballStartX = ballDefaultPos.x
+    game.ballStartY = ballDefaultPos.y
+    local tx, ty = ZoneToPixel(zoneIdx)
+    game.ballTargetX = tx
+    game.ballTargetY = ty
+
+    -- 守门员AI决策：随机选择扑救方向
+    local aiChoices = { 0.25, 0.35, 0.5, 0.65, 0.75 }
+    game.keeperTargetX = aiChoices[math.random(1, #aiChoices)]
+
+    -- 进入飞行状态
+    game.state = STATE.BALL_FLYING
+    game.ballProgress = 0
+    game.stateTimer = 0
+    game.isDragging = false
+
+    print("[GameScene] 射门! 区域:" .. ZONES[zoneIdx].name .. " 力量:" .. string.format("%.0f%%", power * 100))
+end
+
+function DetermineResult()
+    -- 判断进球/被扑
+    local shotZone = game.shotZone
+    local keeperZone = CalcKeeperCoverZone(game.keeperTargetX)
+    local power = game.dragPower
+
+    -- 力量过大有概率射偏
+    local missChance = 0
+    if power > 0.85 then missChance = 0.2 end
+    if power > 0.95 then missChance = 0.4 end
+
+    if math.random() < missChance then
+        -- 射偏
+        game.lastResult = "missed"
+        game.lastResultText = "射偏了!"
+        game.lastResultDesc = "力量太大"
+        table.insert(game.playerRecord, "missed")
+    elseif shotZone == keeperZone then
+        -- 被扑出
+        game.lastResult = "saved"
+        game.lastResultText = "被扑出!"
+        game.lastResultDesc = "守门员判断正确"
+        table.insert(game.playerRecord, "saved")
+    else
+        -- 进球
+        game.lastResult = "goal"
+        game.lastResultText = "GOAL!"
+        game.lastResultDesc = ZONES[shotZone].name .. " 进球"
+        game.playerScore = game.playerScore + 1
+        table.insert(game.playerRecord, "goal")
+    end
+
+    game.state = STATE.RESULT_SHOW
+    game.stateTimer = 0
+    print("[GameScene] 结果: " .. game.lastResultText)
+end
+
+--- 根据守门员X位置判断其覆盖区域
+function CalcKeeperCoverZone(kx)
+    if kx < 0.3 then return 1 end      -- 覆盖左上/左下
+    if kx < 0.4 then return 2 end
+    if kx < 0.6 then return 3 end      -- 中路
+    if kx < 0.7 then return 4 end
+    return 5                             -- 右上/右下
+end
+
+function EnterKeeperTurn()
+    -- AI射门，玩家守门
+    game.state = STATE.KEEPER_TURN
+    game.stateTimer = 0
+    game.keeperX = 0.5
+    game.ballX = ballDefaultPos.x
+    game.ballY = ballDefaultPos.y
+
+    -- AI随机选择射门区域
+    game.aiShotZone = math.random(1, 5)
+    game.aiPower = 0.5 + math.random() * 0.4  -- 0.5~0.9
+
+    print("[GameScene] 对手射门阶段 - AI选择区域: " .. ZONES[game.aiShotZone].name)
+end
+
+function ExecuteAIShot()
+    -- AI球飞向目标
+    game.ballStartX = ballDefaultPos.x
+    game.ballStartY = ballDefaultPos.y
+    local tx, ty = ZoneToPixel(game.aiShotZone)
+    game.ballTargetX = tx
+    game.ballTargetY = ty
+
+    -- 门将AI扑救（这里简化：随机扑一个方向）
+    local saveChoices = { 0.25, 0.4, 0.5, 0.6, 0.75 }
+    game.keeperTargetX = saveChoices[math.random(1, #saveChoices)]
+
+    -- 判断结果
+    local keeperZone = CalcKeeperCoverZone(game.keeperTargetX)
+    local missChance = 0
+    if game.aiPower > 0.85 then missChance = 0.15 end
+
+    if math.random() < missChance then
+        game.lastResult = "missed"
+        game.lastResultText = "对手射偏!"
+        game.lastResultDesc = "力量太大打飞了"
+        table.insert(game.opponentRecord, "missed")
+    elseif game.aiShotZone == keeperZone then
+        game.lastResult = "saved"
+        game.lastResultText = "扑出了!"
+        game.lastResultDesc = "门将判断正确"
+        table.insert(game.opponentRecord, "saved")
+    else
+        game.lastResult = "goal"
+        game.lastResultText = "对手进球"
+        game.lastResultDesc = ZONES[game.aiShotZone].name
+        game.opponentScore = game.opponentScore + 1
+        table.insert(game.opponentRecord, "goal")
+    end
+
+    game.state = STATE.KEEPER_RESULT
+    game.stateTimer = 0
+    -- 简化：跳过球飞行动画直接显示结果
+    print("[GameScene] 对手结果: " .. game.lastResultText)
+end
+
+function AdvanceRound()
+    game.round = game.round + 1
+
+    -- 检查是否比赛结束
+    if game.round > game.maxRounds then
+        if game.playerScore == game.opponentScore then
+            -- 平局进入突然死亡
+            game.state = STATE.SUDDEN_DEATH
             game.stateTimer = 0
-            game.round = game.round + 1
+            game.maxRounds = game.maxRounds + 1  -- 追加一轮
+            print("[GameScene] 突然死亡!")
         else
-            game.state = STATE.ROUND_END
+            -- 比赛结束
+            game.state = STATE.MATCH_END
             game.stateTimer = 0
+            print("[GameScene] 比赛结束! " .. game.playerScore .. ":" .. game.opponentScore)
         end
+    else
+        -- 继续下一轮
+        game.state = STATE.ROUND_INTRO
+        game.stateTimer = 0
     end
 end
 
 -- ============================================================================
--- 输入处理
+-- 输入处理 - 拖拽射门
 -- ============================================================================
+
+local function GetInputPos(eventData, isMouse)
+    local dpr = graphics:GetDPR()
+    local x, y
+    if isMouse then
+        x = input.mousePosition.x
+        y = input.mousePosition.y
+    else
+        x = eventData["X"]:GetInt() / dpr
+        y = eventData["Y"]:GetInt() / dpr
+    end
+    return x, y
+end
+
+--- 检查触摸/点击是否在球附近
+local function IsTouchOnBall(x, y)
+    local bx = ballDefaultPos.x
+    local by = ballDefaultPos.y
+    local dist = math.sqrt((x - bx)^2 + (y - by)^2)
+    return dist < 50  -- 50像素范围内算点中球
+end
 
 ---@param eventType string
 ---@param eventData MouseButtonDownEventData
 function HandleGameMouseDown(eventType, eventData)
-    if game.state ~= STATE.READY then return end
-
     local button = eventData["Button"]:GetInt()
-    if button == MOUSEB_LEFT then
-        -- 获取鼠标位置作为射门目标
-        local mx = input.mousePosition.x
-        local my = input.mousePosition.y
-        local dpr = graphics:GetDPR()
-        local w = graphics:GetWidth() / dpr
-        local h = graphics:GetHeight() / dpr
+    if button ~= MOUSEB_LEFT then return end
 
-        GameScene.Shoot(mx / w, my / h)
+    local x, y = GetInputPos(eventData, true)
+
+    if game.state == STATE.KICKER_AIM and not game.hasShot then
+        if IsTouchOnBall(x, y) then
+            game.isDragging = true
+            game.dragStartX = x
+            game.dragStartY = y
+            game.dragCurrentX = x
+            game.dragCurrentY = y
+        end
+    elseif game.state == STATE.MATCH_END then
+        -- 点击任意处返回菜单
+        ShowMainMenu()
+    end
+end
+
+---@param eventType string
+---@param eventData MouseMoveEventData
+function HandleGameMouseMove(eventType, eventData)
+    if not game.isDragging then return end
+    local x, y = GetInputPos(eventData, true)
+    game.dragCurrentX = x
+    game.dragCurrentY = y
+    UpdateDragState()
+end
+
+---@param eventType string
+---@param eventData MouseButtonUpEventData
+function HandleGameMouseUp(eventType, eventData)
+    if not game.isDragging then return end
+    game.isDragging = false
+    -- 松开时射门
+    if game.state == STATE.KICKER_AIM and not game.hasShot and game.dragPower > 0.1 then
+        ExecuteShot(game.shotZone, game.dragPower)
     end
 end
 
 ---@param eventType string
 ---@param eventData TouchBeginEventData
 function HandleGameTouchBegin(eventType, eventData)
-    if game.state ~= STATE.READY then return end
+    local x, y = GetInputPos(eventData, false)
 
-    local tx = eventData["X"]:GetInt()
-    local ty = eventData["Y"]:GetInt()
-    local dpr = graphics:GetDPR()
-    local w = graphics:GetWidth() / dpr
-    local h = graphics:GetHeight() / dpr
-
-    GameScene.Shoot(tx / dpr / w, ty / dpr / h)
+    if game.state == STATE.KICKER_AIM and not game.hasShot then
+        if IsTouchOnBall(x, y) then
+            game.isDragging = true
+            game.dragStartX = x
+            game.dragStartY = y
+            game.dragCurrentX = x
+            game.dragCurrentY = y
+        end
+    elseif game.state == STATE.MATCH_END then
+        ShowMainMenu()
+    end
 end
 
-function GameScene.Shoot(normalizedX, normalizedY)
-    -- 限制射门范围在球门区域内
-    game.ballTarget.x = Clamp(normalizedX, 0.2, 0.8)
-    game.ballTarget.y = Clamp(normalizedY, 0.18, 0.45)
+---@param eventType string
+---@param eventData TouchMoveEventData
+function HandleGameTouchMove(eventType, eventData)
+    if not game.isDragging then return end
+    local x, y = GetInputPos(eventData, false)
+    game.dragCurrentX = x
+    game.dragCurrentY = y
+    UpdateDragState()
+end
 
-    -- 守门员随机选择扑救方向
-    local keeperChoices = { 0.3, 0.4, 0.5, 0.6, 0.7 }
-    game.keeperTarget.x = keeperChoices[math.random(1, #keeperChoices)]
+---@param eventType string
+---@param eventData TouchEndEventData
+function HandleGameTouchEnd(eventType, eventData)
+    if not game.isDragging then return end
+    game.isDragging = false
+    if game.state == STATE.KICKER_AIM and not game.hasShot and game.dragPower > 0.1 then
+        ExecuteShot(game.shotZone, game.dragPower)
+    end
+end
 
-    -- 切换到射门状态
-    game.state = STATE.SHOOTING
-    game.ballProgress = 0
-    game.stateTimer = 0
+--- 更新拖拽状态（力量和方向）
+function UpdateDragState()
+    local dx = game.dragCurrentX - game.dragStartX
+    local dy = game.dragCurrentY - game.dragStartY
+    local dist = math.sqrt(dx * dx + dy * dy)
 
-    print("[GameScene] Shoot! Target: " .. string.format("%.2f, %.2f", game.ballTarget.x, game.ballTarget.y))
+    -- 力量：拖拽距离映射到 0-1（最大拖拽距离 = 屏幕高度的30%）
+    local maxDrag = screenH * 0.3
+    game.dragPower = math.min(dist / maxDrag, 1.0)
+
+    -- 方向：拖拽向量归一化（向球门方向映射到区域）
+    -- 拖拽方向相对于球门来判定区域
+    -- 玩家从球的位置向球门方向拖拽
+    local normDx = dx / math.max(screenW * 0.3, 1)   -- 水平归一化
+    local normDy = dy / math.max(screenH * 0.3, 1)   -- 垂直归一化
+
+    game.shotZone = CalcTargetZone(normDx, normDy)
+    game.dragAngle = math.atan(dy, dx)
 end
 
 -- ============================================================================
@@ -269,267 +617,584 @@ function HandleGameRender(eventType, eventData)
     screenW = graphics:GetWidth() / dpr
     screenH = graphics:GetHeight() / dpr
 
+    UpdateLayout()
+
     nvgBeginFrame(vg, screenW, screenH, dpr)
 
-    -- 绘制场景
     DrawPitch()
     DrawGoal()
+    DrawZones()
     DrawKeeper()
-    DrawBall()
-    DrawAim()
+    DrawKicker()
+    DrawBallAndTrajectory()
     DrawHUD()
-    DrawStateMessage()
+    DrawCountdown()
+    DrawPowerBar()
+    DrawInstruction()
+    DrawResult()
 
     nvgEndFrame(vg)
 end
 
---- 绘制球场草地
+-- ============================================================================
+-- 绘制函数
+-- ============================================================================
+
+--- 草地球场
 function DrawPitch()
-    -- 渐变绿色草地
+    -- 背景渐变
     nvgBeginPath(vg)
     nvgRect(vg, 0, 0, screenW, screenH)
-    local paint = nvgLinearGradient(vg, 0, 0, 0, screenH, 
-        nvgRGBA(C.pitch[1], C.pitch[2], C.pitch[3], C.pitch[4]),
-        nvgRGBA(C.pitchDark[1], C.pitchDark[2], C.pitchDark[3], C.pitchDark[4]))
+    local paint = nvgLinearGradient(vg, 0, 0, 0, screenH,
+        nvgRGBA(C.pitchGreen[1], C.pitchGreen[2], C.pitchGreen[3], 255),
+        nvgRGBA(C.pitchDark[1], C.pitchDark[2], C.pitchDark[3], 255))
     nvgFillPaint(vg, paint)
     nvgFill(vg)
 
     -- 草地条纹
-    nvgBeginPath(vg)
-    for i = 0, 8 do
-        local y = (screenH / 9) * i
-        nvgRect(vg, 0, y, screenW, screenH / 18)
+    for i = 0, 10 do
+        if i % 2 == 0 then
+            local stripH = screenH / 11
+            nvgBeginPath(vg)
+            nvgRect(vg, 0, i * stripH, screenW, stripH)
+            nvgFillColor(vg, nvgRGBA(255, 255, 255, 6))
+            nvgFill(vg)
+        end
     end
-    nvgFillColor(vg, nvgRGBA(255, 255, 255, 8))
-    nvgFill(vg)
 
     -- 禁区线
-    local boxLeft = screenW * 0.2
-    local boxRight = screenW * 0.8
-    local boxTop = screenH * 0.15
-    local boxBottom = screenH * 0.6
+    local boxL = screenW * 0.15
+    local boxR = screenW * 0.85
+    local boxT = screenH * 0.05
+    local boxB = screenH * 0.55
 
     nvgBeginPath(vg)
-    nvgRect(vg, boxLeft, boxTop, boxRight - boxLeft, boxBottom - boxTop)
+    nvgMoveTo(vg, boxL, boxB)
+    nvgLineTo(vg, boxL, boxT)
+    nvgLineTo(vg, boxR, boxT)
+    nvgLineTo(vg, boxR, boxB)
     nvgStrokeColor(vg, nvgRGBA(C.pitchLine[1], C.pitchLine[2], C.pitchLine[3], C.pitchLine[4]))
     nvgStrokeWidth(vg, 2)
     nvgStroke(vg)
 
     -- 罚球点
     nvgBeginPath(vg)
-    nvgCircle(vg, screenW * 0.5, screenH * 0.75, 4)
-    nvgFillColor(vg, nvgRGBA(C.pitchLine[1], C.pitchLine[2], C.pitchLine[3], C.pitchLine[4]))
+    nvgCircle(vg, ballDefaultPos.x, ballDefaultPos.y, 4)
+    nvgFillColor(vg, nvgRGBA(C.pitchLine[1], C.pitchLine[2], C.pitchLine[3], 150))
     nvgFill(vg)
 end
 
---- 绘制球门
+--- 球门
 function DrawGoal()
-    local goalLeft = screenW * 0.25
-    local goalRight = screenW * 0.75
-    local goalTop = screenH * 0.15
-    local goalBottom = screenH * 0.38
-    local postWidth = 5
+    local gl = goalRect.left
+    local gr = goalRect.right
+    local gt = goalRect.top
+    local gb = goalRect.bottom
+    local pw = 5  -- 门柱宽度
 
     -- 球网背景
     nvgBeginPath(vg)
-    nvgRect(vg, goalLeft, goalTop, goalRight - goalLeft, goalBottom - goalTop)
+    nvgRect(vg, gl, gt, gr - gl, gb - gt)
     nvgFillColor(vg, nvgRGBA(C.goalNet[1], C.goalNet[2], C.goalNet[3], C.goalNet[4]))
     nvgFill(vg)
 
     -- 网格线
-    nvgStrokeColor(vg, nvgRGBA(200, 200, 200, 40))
     nvgStrokeWidth(vg, 1)
-    -- 竖线
-    for i = 1, 9 do
-        local x = goalLeft + (goalRight - goalLeft) * (i / 10)
+    nvgStrokeColor(vg, nvgRGBA(200, 200, 200, 30))
+    local cols = 12
+    local rows = 6
+    for i = 1, cols - 1 do
+        local x = gl + (gr - gl) * (i / cols)
         nvgBeginPath(vg)
-        nvgMoveTo(vg, x, goalTop)
-        nvgLineTo(vg, x, goalBottom)
+        nvgMoveTo(vg, x, gt)
+        nvgLineTo(vg, x, gb)
         nvgStroke(vg)
     end
-    -- 横线
-    for i = 1, 4 do
-        local y = goalTop + (goalBottom - goalTop) * (i / 5)
+    for i = 1, rows - 1 do
+        local y = gt + (gb - gt) * (i / rows)
         nvgBeginPath(vg)
-        nvgMoveTo(vg, goalLeft, y)
-        nvgLineTo(vg, goalRight, y)
+        nvgMoveTo(vg, gl, y)
+        nvgLineTo(vg, gr, y)
         nvgStroke(vg)
     end
 
-    -- 门柱（白色）
+    -- 门柱和横梁
     nvgBeginPath(vg)
-    nvgRect(vg, goalLeft - postWidth, goalTop, postWidth, goalBottom - goalTop)
-    nvgRect(vg, goalRight, goalTop, postWidth, goalBottom - goalTop)
-    nvgRect(vg, goalLeft - postWidth, goalTop - postWidth, goalRight - goalLeft + postWidth * 2, postWidth)
-    nvgFillColor(vg, nvgRGBA(C.goal[1], C.goal[2], C.goal[3], C.goal[4]))
+    nvgRect(vg, gl - pw, gt - pw, pw, gb - gt + pw)  -- 左柱
+    nvgRect(vg, gr, gt - pw, pw, gb - gt + pw)       -- 右柱
+    nvgRect(vg, gl - pw, gt - pw, gr - gl + pw * 2, pw)  -- 横梁
+    nvgFillColor(vg, nvgRGBA(C.goalPost[1], C.goalPost[2], C.goalPost[3], C.goalPost[4]))
     nvgFill(vg)
 end
 
---- 绘制守门员
+--- 5区域虚线圆
+function DrawZones()
+    if game.state ~= STATE.KICKER_AIM then return end
+
+    for i = 1, 5 do
+        local zx, zy = ZoneToPixel(i)
+        local radius = math.min(screenW, screenH) * 0.06
+
+        -- 如果当前瞄准此区域则高亮
+        if game.isDragging and game.shotZone == i then
+            nvgBeginPath(vg)
+            nvgCircle(vg, zx, zy, radius)
+            nvgFillColor(vg, nvgRGBA(C.zoneHighlight[1], C.zoneHighlight[2], C.zoneHighlight[3], C.zoneHighlight[4]))
+            nvgFill(vg)
+        end
+
+        -- 虚线圆环（用短弧线模拟）
+        nvgStrokeColor(vg, nvgRGBA(C.zoneBorder[1], C.zoneBorder[2], C.zoneBorder[3], C.zoneBorder[4]))
+        nvgStrokeWidth(vg, 2)
+        local segments = 16
+        for s = 0, segments - 1, 2 do
+            local a1 = (s / segments) * math.pi * 2
+            local a2 = ((s + 1) / segments) * math.pi * 2
+            nvgBeginPath(vg)
+            nvgArc(vg, zx, zy, radius, a1, a2, NVG_CW)
+            nvgStroke(vg)
+        end
+
+        -- 区域名称
+        nvgFontFace(vg, "sans")
+        nvgFontSize(vg, 12)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(255, 255, 255, 180))
+        nvgText(vg, zx, zy, ZONES[i].name)
+    end
+end
+
+--- 守门员（简笔画卡通风格）
 function DrawKeeper()
-    local kx = screenW * game.keeper.x
-    local ky = screenH * game.keeper.y
-    local bodyW = 24
-    local bodyH = 50
+    local kx = screenW * game.keeperX
+    local ky = goalRect.top + (goalRect.bottom - goalRect.top) * 0.6
+    local scale = screenH * 0.001  -- 缩放因子
 
-    -- 身体（黑色球衣）
-    nvgBeginPath(vg)
-    nvgRoundedRect(vg, kx - bodyW / 2, ky - bodyH / 2, bodyW, bodyH, 6)
-    nvgFillColor(vg, nvgRGBA(C.keeperBody[1], C.keeperBody[2], C.keeperBody[3], C.keeperBody[4]))
-    nvgFill(vg)
+    -- 身体
+    local bodyW = 22 * scale
+    local bodyH = 45 * scale
 
-    -- 手臂（展开状态）
+    -- 蓝色球衣
     nvgBeginPath(vg)
-    nvgRect(vg, kx - bodyW - 12, ky - 8, 16, 8)
-    nvgRect(vg, kx + bodyW - 4, ky - 8, 16, 8)
-    nvgFillColor(vg, nvgRGBA(C.keeper[1], C.keeper[2], C.keeper[3], C.keeper[4]))
+    nvgRoundedRect(vg, kx - bodyW, ky - bodyH * 0.3, bodyW * 2, bodyH, 4)
+    nvgFillColor(vg, nvgRGBA(C.keeperShirt[1], C.keeperShirt[2], C.keeperShirt[3], C.keeperShirt[4]))
     nvgFill(vg)
 
     -- 头部
+    local headR = 10 * scale
     nvgBeginPath(vg)
-    nvgCircle(vg, kx, ky - bodyH / 2 - 8, 10)
-    nvgFillColor(vg, nvgRGBA(C.keeper[1], C.keeper[2], C.keeper[3], C.keeper[4]))
+    nvgCircle(vg, kx, ky - bodyH * 0.3 - headR, headR)
+    nvgFillColor(vg, nvgRGBA(C.keeperSkin[1], C.keeperSkin[2], C.keeperSkin[3], C.keeperSkin[4]))
+    nvgFill(vg)
+
+    -- 手臂（展开姿态）
+    local armLen = 18 * scale
+    nvgBeginPath(vg)
+    nvgRect(vg, kx - bodyW - armLen, ky - bodyH * 0.1, armLen, 6 * scale)
+    nvgRect(vg, kx + bodyW, ky - bodyH * 0.1, armLen, 6 * scale)
+    nvgFillColor(vg, nvgRGBA(C.keeperShirt[1], C.keeperShirt[2], C.keeperShirt[3], C.keeperShirt[4]))
+    nvgFill(vg)
+
+    -- 手套（黄色）
+    nvgBeginPath(vg)
+    nvgCircle(vg, kx - bodyW - armLen, ky - bodyH * 0.1 + 3 * scale, 5 * scale)
+    nvgCircle(vg, kx + bodyW + armLen, ky - bodyH * 0.1 + 3 * scale, 5 * scale)
+    nvgFillColor(vg, nvgRGBA(255, 220, 50, 255))
     nvgFill(vg)
 end
 
---- 绘制足球
-function DrawBall()
-    local bx = screenW * game.ball.x
-    local by = screenH * game.ball.y
-    local radius = 14
+--- 射手（背影，左下角）
+function DrawKicker()
+    if game.state == STATE.KEEPER_TURN or game.state == STATE.KEEPER_RESULT then return end
 
-    -- 球在飞行中缩小（透视效果）
-    if game.state == STATE.SHOOTING then
-        radius = Lerp(14, 10, game.ballProgress)
+    local kx = screenW * 0.28
+    local ky = screenH * 0.82
+    local scale = screenH * 0.0015
+
+    -- 身体（红色球衣）
+    local bodyW = 18 * scale
+    local bodyH = 40 * scale
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, kx - bodyW, ky - bodyH, bodyW * 2, bodyH, 4)
+    nvgFillColor(vg, nvgRGBA(C.kickerShirt[1], C.kickerShirt[2], C.kickerShirt[3], C.kickerShirt[4]))
+    nvgFill(vg)
+
+    -- 号码 "7"
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 14 * scale)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(255, 255, 255, 220))
+    nvgText(vg, kx, ky - bodyH * 0.5, "7")
+
+    -- 头部（头发）
+    local headR = 10 * scale
+    nvgBeginPath(vg)
+    nvgCircle(vg, kx, ky - bodyH - headR, headR)
+    nvgFillColor(vg, nvgRGBA(C.kickerHair[1], C.kickerHair[2], C.kickerHair[3], C.kickerHair[4]))
+    nvgFill(vg)
+
+    -- 短裤
+    nvgBeginPath(vg)
+    nvgRect(vg, kx - bodyW, ky, bodyW * 2, 12 * scale)
+    nvgFillColor(vg, nvgRGBA(C.kickerShorts[1], C.kickerShorts[2], C.kickerShorts[3], C.kickerShorts[4]))
+    nvgFill(vg)
+end
+
+--- 足球 + 拖拽轨迹
+function DrawBallAndTrajectory()
+    local bx, by, radius
+
+    if game.state == STATE.BALL_FLYING then
+        -- 飞行中的球
+        bx = game.ballX
+        by = game.ballY
+        -- 透视缩小效果
+        local t = game.ballProgress
+        radius = Lerp(14, 9, t)
+    elseif game.state == STATE.KICKER_AIM or game.state == STATE.ROUND_INTRO then
+        -- 球在罚球点
+        bx = ballDefaultPos.x
+        by = ballDefaultPos.y
+        radius = 14
+    else
+        bx = ballDefaultPos.x
+        by = ballDefaultPos.y
+        radius = 14
     end
 
-    -- 阴影
+    -- 拖拽时显示轨迹箭头
+    if game.isDragging and game.state == STATE.KICKER_AIM then
+        local tx, ty = ZoneToPixel(game.shotZone)
+        -- 绘制轨迹弧线（从球到目标区域）
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, bx, by)
+        -- 贝塞尔曲线模拟弧线
+        local cx = (bx + tx) * 0.5
+        local cy = (by + ty) * 0.5 - 30  -- 略微拱起
+        nvgQuadTo(vg, cx, cy, tx, ty)
+        nvgStrokeColor(vg, nvgRGBA(C.trajectoryColor[1], C.trajectoryColor[2], C.trajectoryColor[3],
+            math.floor(C.trajectoryColor[4] * game.dragPower)))
+        nvgStrokeWidth(vg, 3)
+        nvgStroke(vg)
+
+        -- 箭头头部
+        nvgBeginPath(vg)
+        nvgCircle(vg, tx, ty, 6)
+        nvgFillColor(vg, nvgRGBA(255, 255, 255, math.floor(180 * game.dragPower)))
+        nvgFill(vg)
+    end
+
+    -- 球体阴影
     nvgBeginPath(vg)
     nvgEllipse(vg, bx + 2, by + 4, radius * 0.9, radius * 0.5)
-    nvgFillColor(vg, nvgRGBA(C.ballShadow[1], C.ballShadow[2], C.ballShadow[3], C.ballShadow[4]))
+    nvgFillColor(vg, nvgRGBA(0, 0, 0, 50))
     nvgFill(vg)
 
-    -- 球体
+    -- 球体（白色）
     nvgBeginPath(vg)
     nvgCircle(vg, bx, by, radius)
-    nvgFillColor(vg, nvgRGBA(C.ball[1], C.ball[2], C.ball[3], C.ball[4]))
+    nvgFillColor(vg, nvgRGBA(C.ballWhite[1], C.ballWhite[2], C.ballWhite[3], C.ballWhite[4]))
     nvgFill(vg)
 
-    -- 球上的花纹（简单十字）
-    nvgStrokeColor(vg, nvgRGBA(50, 50, 50, 100))
-    nvgStrokeWidth(vg, 1.5)
+    -- 球纹（五边形提示）
+    nvgStrokeColor(vg, nvgRGBA(C.ballPattern[1], C.ballPattern[2], C.ballPattern[3], C.ballPattern[4]))
+    nvgStrokeWidth(vg, 1.2)
     nvgBeginPath(vg)
-    nvgMoveTo(vg, bx - radius * 0.5, by)
-    nvgLineTo(vg, bx + radius * 0.5, by)
-    nvgMoveTo(vg, bx, by - radius * 0.5)
-    nvgLineTo(vg, bx, by + radius * 0.5)
+    local penR = radius * 0.4
+    for i = 0, 4 do
+        local a = (i / 5) * math.pi * 2 - math.pi / 2
+        local px = bx + math.cos(a) * penR
+        local py = by + math.sin(a) * penR
+        if i == 0 then nvgMoveTo(vg, px, py) else nvgLineTo(vg, px, py) end
+    end
+    nvgClosePath(vg)
     nvgStroke(vg)
 end
 
---- 绘制瞄准十字
-function DrawAim()
-    if game.state ~= STATE.READY then return end
-
-    -- 鼠标位置作为瞄准指示
-    local dpr = graphics:GetDPR()
-    local mx = input.mousePosition.x / dpr
-    local my = input.mousePosition.y / dpr
-
-    -- 限制在球门范围内
-    local goalLeft = screenW * 0.25
-    local goalRight = screenW * 0.75
-    local goalTop = screenH * 0.15
-    local goalBottom = screenH * 0.38
-
-    mx = Clamp(mx, goalLeft, goalRight)
-    my = Clamp(my, goalTop, goalBottom)
-
-    -- 瞄准十字
-    local size = 12
-    nvgStrokeColor(vg, nvgRGBA(C.aim[1], C.aim[2], C.aim[3], C.aim[4]))
-    nvgStrokeWidth(vg, 2)
-
-    nvgBeginPath(vg)
-    nvgMoveTo(vg, mx - size, my)
-    nvgLineTo(vg, mx + size, my)
-    nvgMoveTo(vg, mx, my - size)
-    nvgLineTo(vg, mx, my + size)
-    nvgStroke(vg)
-
-    -- 瞄准圆环
-    nvgBeginPath(vg)
-    nvgCircle(vg, mx, my, size + 4)
-    nvgStrokeColor(vg, nvgRGBA(C.aim[1], C.aim[2], C.aim[3], 100))
-    nvgStrokeWidth(vg, 1.5)
-    nvgStroke(vg)
-end
-
---- 绘制 HUD（比分、轮次）
+--- HUD：比分栏 + 点球记录
 function DrawHUD()
-    -- 顶部比分栏
-    local barH = 44
+    local barH = 50
+    -- 顶部栏背景
     nvgBeginPath(vg)
-    nvgRect(vg, 0, 0, screenW, barH)
+    nvgRoundedRect(vg, screenW * 0.2, 8, screenW * 0.6, barH, 8)
     nvgFillColor(vg, nvgRGBA(C.hudBg[1], C.hudBg[2], C.hudBg[3], C.hudBg[4]))
     nvgFill(vg)
 
-    -- 比分文字
+    -- A 标签（红色）
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, screenW * 0.2, 8, 36, barH, 8)
+    nvgFillColor(vg, nvgRGBA(C.hudRed[1], C.hudRed[2], C.hudRed[3], C.hudRed[4]))
+    nvgFill(vg)
     nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 16)
     nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(255, 255, 255, 255))
+    nvgText(vg, screenW * 0.2 + 18, 8 + barH / 2, "A")
 
-    -- 玩家比分
-    nvgFontSize(vg, 22)
-    nvgFillColor(vg, nvgRGBA(C.textWhite[1], C.textWhite[2], C.textWhite[3], C.textWhite[4]))
-    nvgText(vg, screenW * 0.3, barH / 2, "YOU  " .. game.playerScore)
+    -- B 标签（蓝色）
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, screenW * 0.8 - 36, 8, 36, barH, 8)
+    nvgFillColor(vg, nvgRGBA(C.hudBlue[1], C.hudBlue[2], C.hudBlue[3], C.hudBlue[4]))
+    nvgFill(vg)
+    nvgFillColor(vg, nvgRGBA(255, 255, 255, 255))
+    nvgText(vg, screenW * 0.8 - 18, 8 + barH / 2, "B")
 
-    -- VS
-    nvgFontSize(vg, 14)
-    nvgFillColor(vg, nvgRGBA(200, 200, 200, 180))
-    nvgText(vg, screenW * 0.5, barH / 2, "VS")
+    -- 比分
+    nvgFontSize(vg, 28)
+    nvgFillColor(vg, nvgRGBA(C.textWhite[1], C.textWhite[2], C.textWhite[3], 255))
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    local scoreText = game.playerScore .. " : " .. game.opponentScore
+    nvgText(vg, screenW * 0.5, 8 + barH / 2 - 6, scoreText)
 
-    -- 对手比分
-    nvgFontSize(vg, 22)
-    nvgFillColor(vg, nvgRGBA(C.textWhite[1], C.textWhite[2], C.textWhite[3], C.textWhite[4]))
-    nvgText(vg, screenW * 0.7, barH / 2, game.opponentScore .. "  CPU")
-
-    -- 轮次
+    -- 点球记录标记
     nvgFontSize(vg, 12)
-    nvgFillColor(vg, nvgRGBA(C.textGold[1], C.textGold[2], C.textGold[3], C.textGold[4]))
-    nvgText(vg, screenW * 0.5, barH + 14, "第 " .. game.round .. " / " .. game.maxRounds .. " 轮")
-end
-
---- 绘制状态提示文字
-function DrawStateMessage()
-    local msg = nil
-
-    if game.state == STATE.READY then
-        msg = "点击球门方向射门!"
-    elseif game.state == STATE.GOAL then
-        msg = "⚽ GOAL!"
-    elseif game.state == STATE.SAVED then
-        msg = "❌ 被扑出!"
-    elseif game.state == STATE.ROUND_END then
-        if game.playerScore > game.opponentScore then
-            msg = "🏆 你赢了!"
-        elseif game.playerScore < game.opponentScore then
-            msg = "💀 你输了..."
-        else
-            msg = "🤝 平局!"
+    local recordY = 8 + barH / 2 + 12
+    -- 玩家记录
+    local startX = screenW * 0.35
+    for i = 1, game.maxRounds do
+        local mark = "—"
+        local color = C.textGray
+        if game.playerRecord[i] == "goal" then
+            mark = "O"
+            color = { 100, 255, 100, 255 }
+        elseif game.playerRecord[i] == "saved" or game.playerRecord[i] == "missed" then
+            mark = "X"
+            color = { 255, 80, 80, 255 }
         end
+        nvgFillColor(vg, nvgRGBA(color[1], color[2], color[3], color[4]))
+        nvgText(vg, startX + (i - 1) * 16, recordY, mark)
+    end
+    -- 对手记录
+    startX = screenW * 0.55
+    for i = 1, game.maxRounds do
+        local mark = "—"
+        local color = C.textGray
+        if game.opponentRecord[i] == "goal" then
+            mark = "O"
+            color = { 100, 255, 100, 255 }
+        elseif game.opponentRecord[i] == "saved" or game.opponentRecord[i] == "missed" then
+            mark = "X"
+            color = { 255, 80, 80, 255 }
+        end
+        nvgFillColor(vg, nvgRGBA(color[1], color[2], color[3], color[4]))
+        nvgText(vg, startX + (i - 1) * 16, recordY, mark)
     end
 
-    if msg then
+    -- 身份标识（右上角）
+    if game.state == STATE.KICKER_AIM or game.state == STATE.BALL_FLYING or game.state == STATE.RESULT_SHOW then
+        DrawIdentityBadge("你是点球手", true)
+    elseif game.state == STATE.KEEPER_TURN or game.state == STATE.KEEPER_RESULT then
+        DrawIdentityBadge("你是守门员", false)
+    end
+end
+
+function DrawIdentityBadge(text, isKicker)
+    local badgeW = 110
+    local badgeH = 30
+    local bx = screenW - badgeW - 12
+    local by = 12
+
+    -- 背景
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, bx, by, badgeW, badgeH, 6)
+    nvgFillColor(vg, nvgRGBA(C.hudBg[1], C.hudBg[2], C.hudBg[3], 240))
+    nvgFill(vg)
+    -- 金色边框
+    nvgStrokeColor(vg, nvgRGBA(C.textGold[1], C.textGold[2], C.textGold[3], 200))
+    nvgStrokeWidth(vg, 1.5)
+    nvgStroke(vg)
+
+    -- 星星图标 + 文字
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 13)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(C.textGold[1], C.textGold[2], C.textGold[3], 255))
+    nvgText(vg, bx + badgeW / 2, by + badgeH / 2, "★ " .. text)
+end
+
+--- SlowMo 倒计时大数字
+function DrawCountdown()
+    if game.state ~= STATE.KICKER_AIM then return end
+
+    -- 大号倒计时数字
+    local num = tostring(game.countdownInt)
+    local alpha = 255
+    -- 闪烁效果
+    local frac = game.countdown - math.floor(game.countdown)
+    if frac > 0.7 then
+        alpha = math.floor(255 * (1.0 - (frac - 0.7) / 0.3))
+    end
+
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 72)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+
+    -- 阴影
+    nvgFillColor(vg, nvgRGBA(0, 0, 0, math.floor(alpha * 0.5)))
+    nvgText(vg, screenW * 0.5 + 3, screenH * 0.08 + 3, num)
+
+    -- 金色数字
+    nvgFillColor(vg, nvgRGBA(C.countdownColor[1], C.countdownColor[2], C.countdownColor[3], alpha))
+    nvgText(vg, screenW * 0.5, screenH * 0.08, num)
+end
+
+--- 力量条
+function DrawPowerBar()
+    if game.state ~= STATE.KICKER_AIM then return end
+
+    local barW = screenW * 0.4
+    local barH = 16
+    local bx = (screenW - barW) / 2
+    local by = screenH * 0.90
+
+    -- 背景
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, bx, by, barW, barH, 4)
+    nvgFillColor(vg, nvgRGBA(30, 30, 30, 180))
+    nvgFill(vg)
+
+    -- 力量填充（渐变色：绿→黄→红）
+    if game.dragPower > 0 then
+        local fillW = barW * game.dragPower
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, bx, by, fillW, barH, 4)
+
+        local r, g, b
+        if game.dragPower < 0.5 then
+            local t = game.dragPower / 0.5
+            r = math.floor(Lerp(C.powerLow[1], C.powerMid[1], t))
+            g = math.floor(Lerp(C.powerLow[2], C.powerMid[2], t))
+            b = math.floor(Lerp(C.powerLow[3], C.powerMid[3], t))
+        else
+            local t = (game.dragPower - 0.5) / 0.5
+            r = math.floor(Lerp(C.powerMid[1], C.powerHigh[1], t))
+            g = math.floor(Lerp(C.powerMid[2], C.powerHigh[2], t))
+            b = math.floor(Lerp(C.powerMid[3], C.powerHigh[3], t))
+        end
+        nvgFillColor(vg, nvgRGBA(r, g, b, 255))
+        nvgFill(vg)
+    end
+
+    -- 力量等级标签
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 10)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_TOP)
+    nvgFillColor(vg, nvgRGBA(C.textGray[1], C.textGray[2], C.textGray[3], C.textGray[4]))
+    nvgText(vg, bx + barW * 0.17, by + barH + 4, "LOW")
+    nvgText(vg, bx + barW * 0.5, by + barH + 4, "MID")
+    nvgText(vg, bx + barW * 0.83, by + barH + 4, "HIGH")
+end
+
+--- 操作提示文字
+function DrawInstruction()
+    if game.state == STATE.KICKER_AIM and not game.isDragging and not game.hasShot then
         nvgFontFace(vg, "sans")
-        nvgFontSize(vg, 28)
+        nvgFontSize(vg, 16)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(255, 255, 255, 200))
+        nvgText(vg, screenW * 0.5, screenH * 0.85, "👆 拖拽足球射门")
+    end
+end
+
+--- 结果显示（进球/扑出/射偏）
+function DrawResult()
+    if game.state == STATE.ROUND_INTRO then
+        -- 轮次介绍
+        nvgFontFace(vg, "sans")
+        nvgFontSize(vg, 32)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(C.textWhite[1], C.textWhite[2], C.textWhite[3], 255))
+        nvgText(vg, screenW * 0.5, screenH * 0.45, "第 " .. game.round .. " 轮")
+
+        nvgFontSize(vg, 18)
+        nvgFillColor(vg, nvgRGBA(C.textGold[1], C.textGold[2], C.textGold[3], 255))
+        nvgText(vg, screenW * 0.5, screenH * 0.52, "你是点球手")
+
+    elseif game.state == STATE.RESULT_SHOW or game.state == STATE.KEEPER_RESULT then
+        -- 结果大字
+        local color = C.textWhite
+        if game.lastResult == "goal" and game.state == STATE.RESULT_SHOW then
+            color = { 100, 255, 100, 255 }
+        elseif game.lastResult == "goal" and game.state == STATE.KEEPER_RESULT then
+            color = { 255, 80, 80, 255 }
+        elseif game.lastResult == "saved" then
+            color = C.textGold
+        end
+
+        -- 半透明背景
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, screenW * 0.2, screenH * 0.4, screenW * 0.6, screenH * 0.2, 12)
+        nvgFillColor(vg, nvgRGBA(0, 0, 0, 160))
+        nvgFill(vg)
+
+        nvgFontFace(vg, "sans")
+        nvgFontSize(vg, 36)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(color[1], color[2], color[3], color[4]))
+        nvgText(vg, screenW * 0.5, screenH * 0.47, game.lastResultText)
+
+        nvgFontSize(vg, 14)
+        nvgFillColor(vg, nvgRGBA(C.textGray[1], C.textGray[2], C.textGray[3], 255))
+        nvgText(vg, screenW * 0.5, screenH * 0.55, game.lastResultDesc)
+
+    elseif game.state == STATE.KEEPER_TURN then
+        -- 对手射门提示
+        nvgFontFace(vg, "sans")
+        nvgFontSize(vg, 24)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(C.textWhite[1], C.textWhite[2], C.textWhite[3], 255))
+        nvgText(vg, screenW * 0.5, screenH * 0.45, "对手射门中...")
+
+    elseif game.state == STATE.SUDDEN_DEATH then
+        -- 突然死亡
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, screenW * 0.15, screenH * 0.35, screenW * 0.7, screenH * 0.3, 12)
+        nvgFillColor(vg, nvgRGBA(150, 20, 20, 200))
+        nvgFill(vg)
+
+        nvgFontFace(vg, "sans")
+        nvgFontSize(vg, 36)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(255, 255, 255, 255))
+        nvgText(vg, screenW * 0.5, screenH * 0.45, "突然死亡!")
+
+        nvgFontSize(vg, 16)
+        nvgFillColor(vg, nvgRGBA(C.textGold[1], C.textGold[2], C.textGold[3], 255))
+        nvgText(vg, screenW * 0.5, screenH * 0.55, "一球定胜负")
+
+    elseif game.state == STATE.MATCH_END then
+        -- 比赛结算
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, screenW * 0.15, screenH * 0.25, screenW * 0.7, screenH * 0.5, 12)
+        nvgFillColor(vg, nvgRGBA(0, 0, 0, 200))
+        nvgFill(vg)
+
+        nvgFontFace(vg, "sans")
         nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
 
-        -- 文字阴影
-        nvgFillColor(vg, nvgRGBA(0, 0, 0, 150))
-        nvgText(vg, screenW * 0.5 + 2, screenH * 0.62 + 2, msg)
+        -- 胜负标题
+        local titleText, titleColor
+        if game.playerScore > game.opponentScore then
+            titleText = "你赢了!"
+            titleColor = { 100, 255, 100, 255 }
+        else
+            titleText = "你输了"
+            titleColor = { 255, 80, 80, 255 }
+        end
 
-        -- 文字
-        nvgFillColor(vg, nvgRGBA(C.textWhite[1], C.textWhite[2], C.textWhite[3], C.textWhite[4]))
-        nvgText(vg, screenW * 0.5, screenH * 0.62, msg)
+        nvgFontSize(vg, 40)
+        nvgFillColor(vg, nvgRGBA(titleColor[1], titleColor[2], titleColor[3], titleColor[4]))
+        nvgText(vg, screenW * 0.5, screenH * 0.35, titleText)
+
+        -- 最终比分
+        nvgFontSize(vg, 28)
+        nvgFillColor(vg, nvgRGBA(255, 255, 255, 255))
+        nvgText(vg, screenW * 0.5, screenH * 0.45, game.playerScore .. " : " .. game.opponentScore)
+
+        -- 提示
+        nvgFontSize(vg, 14)
+        nvgFillColor(vg, nvgRGBA(C.textGray[1], C.textGray[2], C.textGray[3], 255))
+        nvgText(vg, screenW * 0.5, screenH * 0.62, "点击任意处返回主菜单")
     end
 end
 
